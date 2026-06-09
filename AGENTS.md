@@ -4,6 +4,122 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## What Hermes Is
+
+Hermes is a personal AI agent that runs the same agent core across a CLI, a
+messaging gateway (Telegram, Discord, Slack, and ~20 other platforms), a TUI,
+and an Electron desktop app. It learns across sessions (memory + skills),
+delegates to subagents, runs scheduled jobs, and drives a real terminal and
+browser. It is extended primarily through **plugins and skills**, not by
+growing the core.
+
+Two properties shape almost every design decision and are the lens for
+reviewing any change:
+
+- **Per-conversation prompt caching is sacred.** A long-lived conversation
+  reuses a cached prefix every turn. Anything that mutates past context,
+  swaps toolsets, or rebuilds the system prompt mid-conversation invalidates
+  that cache and multiplies the user's cost. We do not do it (the one
+  exception is context compression).
+- **The core is a narrow waist; capability lives at the edges.** Every model
+  tool we add is sent on every API call, so the bar for a new *core* tool is
+  high. Most new capability should arrive as a CLI command + skill, a
+  service-gated tool, or a plugin — not as core surface.
+
+## Contribution Rubric — What We Want / What We Don't
+
+This is the intent layer. When evaluating ANY change — your own work, an
+external PR, or a triage decision — judge it against these rules first, then
+get into mechanics. The "smallest thing that correctly solves the stated
+problem" almost always wins.
+
+### What we want
+
+- **The smallest footprint that works.** Prefer, in order: extend existing
+  code → CLI command + skill → service-gated tool (`check_fn`) → plugin →
+  new core tool (last resort). See "The Footprint Ladder" below.
+- **Every changed line traces to the request.** Apply the senior-engineer
+  test: "Would a senior engineer call this overcomplicated?" If yes, simplify.
+- **Extend, don't duplicate.** Before adding a module/manager/hook, check
+  whether existing infrastructure already covers the use case. A new backend
+  for an existing category (browser, search, provider, memory) must integrate
+  with the existing setup/config UX (`hermes tools`, `hermes setup`,
+  auto-install), not just expose an env var.
+- **Fix the whole bug class, not one site.** If the same defect exists at
+  sibling call paths the reporter didn't touch, fix those too. Salvage AND
+  widen — not "salvage + tracking issue."
+- **Behavior contracts over snapshots.** Tests should assert how two pieces of
+  data must relate (invariants), not freeze a current value (model lists,
+  config version literals, enumeration counts). See "Don't write
+  change-detector tests."
+- **E2E validation, not just green unit mocks.** For anything touching
+  resolution chains, config propagation, security boundaries, remote
+  backends, or file/network I/O, exercise the real path with real imports
+  against a temp `HERMES_HOME`. Mocks hide integration bugs.
+- **Cache-, alternation-, and invariant-safe.** Preserve prompt caching, strict
+  message role alternation (never two same-role messages in a row; never a
+  synthetic user message injected mid-loop), and a system prompt that is
+  byte-stable for the life of a conversation.
+- **Contributor credit preserved.** Salvage external work by cherry-picking
+  (rebase-merge) so authorship survives in git history; don't reimplement from
+  scratch when you can build on top.
+
+### What we don't want (rejected even when well-built)
+
+- **Speculative infrastructure.** Hooks, callbacks, or extension points with no
+  concrete consumer. Adding a hook is easy; removing one after plugins depend
+  on it is hard. A hook is NOT speculative if a contributor has a real, stated
+  use case — even if the consumer ships separately.
+- **New `HERMES_*` env vars for non-secret config.** `.env` is for secrets
+  only (API keys, tokens, passwords). All behavioral settings — timeouts,
+  thresholds, feature flags, display prefs — go in `config.yaml`. Bridge to an
+  internal env var if the mechanism needs one, but user-facing docs point to
+  `config.yaml`. Reject PRs that tell users to "set X in your .env" unless X
+  is a credential.
+- **A new core tool when terminal + file already do the job, or when a skill
+  would.** If the only barrier is file visibility on a remote backend, fix the
+  mount, not the toolset.
+- **Lazy-reading escape hatches on instructional tools.** No `offset`/`limit`
+  pagination on tools that load content the agent must read fully (skills,
+  prompts, playbooks). Models will read page 1 and skip the rest.
+- **"Fixes" that destroy the feature they secure.** A mitigation that kills the
+  feature's purpose is the wrong mitigation. Read the original commit's intent
+  (`git log -p -S`) before restricting behavior; find a fix that preserves the
+  feature.
+- **Outbound telemetry / usage attribution without opt-in gating.** No new
+  analytics, third-party identifier tagging, or attribution tags until a
+  generic user-facing opt-in (config gate + setup prompt + `hermes tools`
+  toggle) exists. Park behind a label, do not merge.
+- **Change-detector tests, cache-breaking mid-conversation, dead code wired in
+  without E2E proof, and plugins that touch core files.** Plugins live in their
+  own directory and work within the ABCs/hooks we provide; if a plugin needs
+  more, widen the generic plugin surface, don't special-case it in core.
+
+### The Footprint Ladder (new capability decision)
+
+Each rung adds more permanent surface than the one above. Choose the highest
+(least-footprint) rung that correctly solves the problem:
+
+1. **Extend existing code** — the capability is a variation of something that
+   already exists. Zero new surface.
+2. **CLI command + skill** — manages config/state/infra expressible as shell
+   commands. The agent runs `hermes <subcommand>` guided by a skill. Zero
+   model-tool footprint. Default choice for subscriptions, scheduled tasks,
+   service setup. Examples: `hermes webhook`, `hermes cron`, `hermes tools`.
+3. **Service-gated tool (`check_fn`)** — needs structured params/returns AND
+   only appears when a prerequisite is configured. Zero footprint otherwise.
+   Examples: Home Assistant tools (gated on token), memory-provider tools.
+4. **Plugin** — third-party/niche/user-specific capability that doesn't ship in
+   core. Lives in `~/.hermes/plugins/` or a pip package, discovered at runtime.
+5. **New core tool** — only when the capability is fundamental, broadly useful
+   to nearly every user, and unreachable via terminal + file. Examples of
+   correct core tools: terminal, read_file, web_search, browser_navigate.
+
+When 3+ open PRs try to integrate the same *category* of thing (memory
+backends, providers, notifiers), don't merge them one at a time — design an
+ABC + orchestrator, wrap the existing built-in as the first provider, and turn
+the competing PRs into plugins against that interface.
+
 ## Development Environment
 
 ```bash
@@ -302,9 +418,11 @@ A **separate** chat surface from both the classic CLI and the dashboard's embedd
 
 ## Adding New Tools
 
-For most custom or local-only tools, do **not** edit Hermes core. Use the plugin
-route instead: create `~/.hermes/plugins/<name>/plugin.yaml` and
-`~/.hermes/plugins/<name>/__init__.py`, then register tools with
+Before adding any tool, settle the footprint question first (see "The
+Footprint Ladder" in the Contribution Rubric): most capabilities should NOT
+be core tools. For custom or local-only tools, do **not** edit Hermes core.
+Use the plugin route instead: create `~/.hermes/plugins/<name>/plugin.yaml`
+and `~/.hermes/plugins/<name>/__init__.py`, then register tools with
 `ctx.register_tool(...)`. Plugin toolsets are discovered automatically and can be
 enabled or disabled without touching `tools/` or `toolsets.py`.
 
